@@ -80,19 +80,12 @@ async function corxLoadAll(auth) {
 }
 
 function parseDevices(groups) {
+  // 实际结构：每个分组含 deviceList（设备）+ hwList（点位，含 id/devId/mac/addr）
   const devices = []
   const hws = []
   for (const g of groups || []) {
-    if (g.devices) {
-      for (const d of g.devices) {
-        devices.push(d)
-        if (d.hws) {
-          for (const h of d.hws) {
-            hws.push({ ...h, devId: d.devId, mac: d.mac })
-          }
-        }
-      }
-    }
+    for (const d of g.deviceList || []) devices.push(d)
+    for (const h of g.hwList || []) hws.push(h)
   }
   return { devices, hws }
 }
