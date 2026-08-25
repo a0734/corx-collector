@@ -131,6 +131,18 @@ async function collectOnce() {
     return { ok: true, msg: '记录已停用或无点位，跳过', written: 0 }
   }
 
+  // 1.5 按记录间隔判断：距云端最后一条记录不足 intervalMin 分钟则跳过
+  //     （GitHub cron 固定 5 分钟触发一次，实际写入频率由控制台设置的间隔决定）
+  const intervalMs = cloudCfg.intervalMin * 60 * 1000
+  const lastRows = await sbGet('/rest/v1/report_records?select=t&order=t.desc&limit=1')
+  if (Array.isArray(lastRows) && lastRows.length > 0) {
+    const lastT = Date.parse(lastRows[0].t)
+    if (!Number.isNaN(lastT) && Date.now() - lastT < intervalMs) {
+      const waitMin = Math.ceil((intervalMs - (Date.now() - lastT)) / 60000)
+      return { ok: true, msg: `距上次记录不足 ${cloudCfg.intervalMin} 分钟（还需约 ${waitMin} 分钟），跳过`, written: 0 }
+    }
+  }
+
   // 2. 登录 + 加载设备
   const auth = await corxLogin()
   const { hws } = await corxLoadAll(auth)
