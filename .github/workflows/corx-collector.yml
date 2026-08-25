@@ -1,0 +1,42 @@
+# CORX IoT 定时采集 — GitHub Actions 版
+# 每 5 分钟触发一次，自动登录 CORX → 读云端配置 → 采集 → 写入 Supabase
+#
+# 费用：公开仓库永久免费，私有仓库 2000 分钟/月免费（本项目约 720 分钟/月）
+#
+# 部署步骤：
+# 1. 在 GitHub 新建一个仓库（公开或私有均可）
+# 2. 把 corx-collector-scf.js 上传到仓库根目录，重命名为 index.js
+# 3. 仓库 Settings → Secrets and variables → Actions → New repository secret：
+#    - CORX_TEL = 你的 CORX 手机号
+#    - CORX_PASSWORD = 你的 CORX 密码
+# 4. 把本文件放到仓库 .github/workflows/ 目录下
+# 5. push 到 GitHub，自动开始每 5 分钟运行
+#
+# 查看运行日志：仓库 → Actions 标签 → 点对应的工作流运行
+# 停止：Actions → 选择工作流 → 右上角 "..." → Disable workflow
+
+name: CORX Collector
+
+on:
+  schedule:
+    # 每 5 分钟一次（GitHub cron 最低 5 分钟粒度，实际可能延迟 5~15 分钟）
+    - cron: '*/5 * * * *'
+  # 支持手动触发（测试用）
+  workflow_dispatch: {}
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 运行采集
+        env:
+          CORX_TEL: ${{ secrets.CORX_TEL }}
+          CORX_PASSWORD: ${{ secrets.CORX_PASSWORD }}
+        run: node index.js
