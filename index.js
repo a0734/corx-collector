@@ -131,15 +131,19 @@ async function collectOnce() {
     return { ok: true, msg: '记录已停用或无点位，跳过', written: 0 }
   }
 
-  // 1.5 按记录间隔判断：距云端最后一条记录不足 intervalMin 分钟则跳过
-  //     （GitHub cron 固定 5 分钟触发一次，实际写入频率由控制台设置的间隔决定）
+  // 1.5 网格对齐判断：记录点固定对齐到整点/半点/整刻（由间隔决定），消除 cron 触发延迟导致的累计漂移
+  //     —— 只要当前网格（如 60 分钟间隔的「本整点」）已有记录就跳过，写入时间戳用网格点而非实际触发时刻
   const intervalMs = cloudCfg.intervalMin * 60 * 1000
+  const slot = Math.floor(Date.now() / intervalMs) * intervalMs
   const lastRows = await sbGet('/rest/v1/report_records?select=t&order=t.desc&limit=1')
   if (Array.isArray(lastRows) && lastRows.length > 0) {
     const lastT = Date.parse(lastRows[0].t)
-    if (!Number.isNaN(lastT) && Date.now() - lastT < intervalMs) {
-      const waitMin = Math.ceil((intervalMs - (Date.now() - lastT)) / 60000)
-      return { ok: true, msg: `距上次记录不足 ${cloudCfg.intervalMin} 分钟（还需约 ${waitMin} 分钟），跳过`, written: 0 }
+    if (!Number.isNaN(lastT)) {
+      const lastSlot = Math.floor(lastT / intervalMs) * intervalMs
+      if (lastSlot >= slot) {
+        const slotStr = new Date(slot).toISOString().replace('T', ' ').slice(0, 16)
+        return { ok: true, msg: `当前时段（${slotStr} UTC）已有记录，跳过`, written: 0 }
+      }
     }
   }
 
@@ -166,8 +170,8 @@ async function collectOnce() {
     }
   }
 
-  // 4. 写入 Supabase
-  const snapshot = { t: new Date().toISOString(), v }
+  // 4. 写入 Supabase（t = 网格时间戳，保证相邻记录间隔恒等于设定值）
+  const snapshot = { t: new Date(slot).toISOString(), v }
   await sbPost('/rest/v1/report_records', [snapshot])
 
   const summary = Object.entries(v).map(([k, val]) => `${k}=${val}`).join(', ')
