@@ -147,33 +147,24 @@ async function collectOnce() {
   // 取最近 200 条记录 → 已记录的网格集合（防重复写）
   const recent = await sbGet('/rest/v1/report_records?select=t&order=t.desc&limit=200')
   const recordedSlots = new Set()
-  let lastSlot = 0
   if (Array.isArray(recent)) {
     for (const r of recent) {
       const ts = Date.parse(r.t)
-      if (Number.isNaN(ts)) continue
-      const s = Math.floor(ts / intervalMs) * intervalMs
-      recordedSlots.add(s)
-      if (s > lastSlot) lastSlot = s
+      if (!Number.isNaN(ts)) recordedSlots.add(Math.floor(ts / intervalMs) * intervalMs)
     }
   }
 
-  // 补录起点：上次记录 + 1 格；无记录则从「当前网格前 24 小时」起步
-  const fillStart = lastSlot > 0
-    ? Math.min(lastSlot + intervalMs, S_now - MAX_FILL_MS)
-    : S_now - MAX_FILL_MS
-
-  // 若当前网格未到（cron 触发早于本小时整点），暂不写
-  if (fillStart > S_now) {
-    return { ok: true, msg: '本时段尚未到达，跳过', written: 0 }
-  }
+  // 补录范围：最近 24 格内的所有缺失网格（含中间空洞——之前写入失败/被删的记录会被自动重试）
+  const rangeStart = S_now - MAX_FILL_MS
 
   // 2. 登录 + 加载设备
   const auth = await corxLogin()
   const { hws } = await corxLoadAll(auth)
 
-  // 3. 按点位一次性拉取 [fillStart, now] 设备历史
-  const startSec = Math.max(0, Math.floor(fillStart / 1000) - 60) // 多取 1 分钟容差
+  // 3. 按点位一次性拉取 [rangeStart-30min, now] 设备历史
+  //    注意窗口必须足够宽：设备上报周期 ~3.5 分钟，若只查补录起点附近几分钟，
+  //    经常一条数据都捞不到 → 整条记录全 null。前扩 30 分钟保证每个网格附近都有实测值
+  const startSec = Math.max(0, Math.floor(rangeStart / 1000) - 1800)
   const endSec = Math.floor(Date.now() / 1000)
   const pointData = {}  // hwId -> [[ts_sec, val], ...]
   const pointMissing = [] // 缺失点（设备列表里找不到 hw）
@@ -193,33 +184,44 @@ async function collectOnce() {
   }
 
   // 4. 为每个缺失网格构造记录：从该点位的历史数据中选取最接近网格点的值
+  //    容差 = 半个间隔 + 10 分钟：超过说明设备离线太久，宁可留待重试也不错配远处的值
+  //    注意：历史接口的时间戳是 ISO 字符串（带 +08:00 时区），不是数字，需兼容解析
+  const TOL_MS = intervalMs / 2 + 10 * 60 * 1000
   const records = []
-  for (let s = fillStart; s <= S_now; s += intervalMs) {
+  for (let s = rangeStart; s <= S_now; s += intervalMs) {
     if (recordedSlots.has(s)) continue  // 已记录跳过
     const v = {}
     for (const hwId of cloudCfg.hwIds) {
       const arr = pointData[hwId] || []
       let best = null
       let bestDelta = Infinity
-      for (const [ts, val] of arr) {
-        if (typeof ts !== 'number') continue
-        const delta = Math.abs(ts * 1000 - s)
+      for (const [rawTs, val] of arr) {
+        let ms
+        if (typeof rawTs === 'number') ms = rawTs * 1000
+        else if (typeof rawTs === 'string') {
+          const p = Date.parse(rawTs)
+          if (Number.isNaN(p)) continue
+          ms = p
+        } else continue
+        const delta = Math.abs(ms - s)
         if (delta < bestDelta) { bestDelta = delta; best = val }
       }
-      v[hwId] = best
+      v[hwId] = (best !== null && bestDelta <= TOL_MS) ? best : null
     }
+    // 全空记录不写入：留给下一轮重试（历史接口偶发失败 / 设备短暂离线均可自愈）
+    if (Object.values(v).every(x => x === null)) continue
     records.push({ t: new Date(s).toISOString(), v })
   }
 
   if (records.length === 0) {
-    return { ok: true, msg: `当前时段（${new Date(S_now).toISOString().slice(0, 16)} UTC）已有记录，跳过`, written: 0 }
+    return { ok: true, msg: `最近 ${MAX_FILL_SLOTS} 格均已记录或暂无数据，跳过`, written: 0 }
   }
 
   // 5. 批量写入（代码层已用 recordedSlots 去重，无需 on_conflict）
   await sbPost('/rest/v1/report_records', records)
 
   const skipped = pointMissing.length
-  const summary = `补录 ${records.length} 个时段（${new Date(fillStart).toISOString().slice(0, 16)} ~ ${new Date(S_now).toISOString().slice(0, 16)} UTC）`
+  const summary = `补录 ${records.length} 个时段（${new Date(rangeStart).toISOString().slice(0, 16)} ~ ${new Date(S_now).toISOString().slice(0, 16)} UTC）`
   return { ok: true, msg: summary, written: records.length, pointCount: cloudCfg.hwIds.length, skipped }
 }
 
