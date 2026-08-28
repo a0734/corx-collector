@@ -1,33 +1,44 @@
-# CORX IoT 定时采集 — GitHub Actions 版
-# 每 5 分钟触发一次，自动登录 CORX → 读云端配置 → 采集 → 写入 Supabase
+# CORX IoT 定时采集 — GitHub Actions 常驻续链版
 #
-# 费用：公开仓库永久免费，私有仓库 2000 分钟/月免费（本项目约 720 分钟/月）
+# 原理：GitHub schedule cron 高频任务会大量静默丢弃（实测不可靠），因此：
+#   1. 每个任务常驻 50 分钟，每 5 分钟整刻采集一轮（index.js 的 RESIDENT 模式）
+#   2. 任务结束前自我 dispatch 触发下一轮 → 24/7 续链
+#   3. cron 每 15 分钟保活备份（续链意外断裂时兜底重启，错开整点避免影响整点采集）
+#
+# 费用：公开仓库 Actions 永久免费不限量（本仓库已设为 public，密码存于 Secrets 不入库）
 #
 # 部署步骤：
-# 1. 在 GitHub 新建一个仓库（公开或私有均可）
-# 2. 把 corx-collector-scf.js 上传到仓库根目录，重命名为 index.js
+# 1. 新建一个【公开】仓库
+# 2. 上传 index.js 到仓库根目录
 # 3. 仓库 Settings → Secrets and variables → Actions → New repository secret：
-#    - CORX_TEL = 你的 CORX 手机号
-#    - CORX_PASSWORD = 你的 CORX 密码
-# 4. 把本文件放到仓库 .github/workflows/ 目录下
-# 5. push 到 GitHub，自动开始每 5 分钟运行
+#    - CORX_TEL = CORX 手机号
+#    - CORX_PASSWORD = CORX 密码
+# 4. 把本文件放到 .github/workflows/ 目录，push 后自动开始常驻采集
 #
-# 查看运行日志：仓库 → Actions 标签 → 点对应的工作流运行
+# 查看运行日志：仓库 → Actions 标签
 # 停止：Actions → 选择工作流 → 右上角 "..." → Disable workflow
 
 name: CORX Collector
 
 on:
   schedule:
-    # 每 5 分钟一次（GitHub cron 最低 5 分钟粒度，实际可能延迟 5~15 分钟）
-    - cron: '*/5 * * * *'
-  # 支持手动触发（测试用）
+    # 保活备份：每 15 分钟（:03/:18/:33/:48，刻意错开整点采集刻）
+    - cron: '3-59/15 * * * *'
+  # 手动触发 + 自我续链触发
   workflow_dispatch: {}
+
+permissions:
+  actions: write # 允许用 GITHUB_TOKEN 自我 dispatch 续链
+
+# 同一时间只允许一个采集任务在跑；cron 保活触发的新任务会接管旧的
+concurrency:
+  group: collector
+  cancel-in-progress: true
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
 
@@ -35,8 +46,25 @@ jobs:
         with:
           node-version: '20'
 
-      - name: 运行采集
+      - name: 常驻采集（50 分钟，每 5 分钟整刻一轮）
         env:
           CORX_TEL: ${{ secrets.CORX_TEL }}
           CORX_PASSWORD: ${{ secrets.CORX_PASSWORD }}
+          RESIDENT: '1'
         run: node index.js
+
+      - name: 自我续链（触发下一轮常驻）
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for i in 1 2 3; do
+            if gh api -X POST repos/a0734/corx-collector/actions/workflows/corx-collector.yml/dispatches -f ref=main --silent; then
+              echo "续链成功"
+              exit 0
+            fi
+            echo "第 $i 次续链失败，5 秒后重试"
+            sleep 5
+          done
+          echo "续链失败（不影响数据，等待 cron 保活 15 分钟内自动重启）"
+          exit 0
