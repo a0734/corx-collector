@@ -239,16 +239,64 @@ exports.main_handler = async (event, context) => {
   }
 }
 
+// ===== 常驻模式（GitHub Actions 自我续链） =====
+//
+// 背景：GitHub 的 schedule cron 对高频任务会大量静默丢弃/延迟（实测一天只跑十几次，
+// 甚至 30+ 小时一次不跑），无法满足「按间隔准时记录」。
+// 方案：每个 Actions 任务内常驻 50 分钟，每 5 分钟整刻采集一轮；任务结束前由工作流
+// 自我 dispatch 触发下一轮，形成 24/7 续链；cron 仅作每 15 分钟保活备份。
+// 公开仓库 Actions 免费不限量。
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms))
+}
+
+/** 下一个 5 分钟整刻时间戳 */
+function next5MinMark(from = Date.now()) {
+  return Math.floor(from / (5 * 60 * 1000)) * (5 * 60 * 1000) + 5 * 60 * 1000
+}
+
+async function runResident() {
+  const JOB_MAX_MS = 50 * 60 * 1000 // 单轮最长 50 分钟（timeout-minutes: 55 留余量）
+  const start = Date.now()
+  console.log(`[${ts()}] 常驻模式启动，本轮最长 50 分钟`)
+  while (Date.now() - start < JOB_MAX_MS) {
+    const wait = next5MinMark() - Date.now()
+    if (wait > 0) {
+      console.log(`[${ts()}] 等待 ${(wait / 1000).toFixed(0)}s 到下一采集刻…`)
+      await sleep(wait)
+    }
+    if (Date.now() - start >= JOB_MAX_MS) break
+    try {
+      const r = await collectOnce()
+      console.log(`[${ts()}] 采集完成：${r.msg}`)
+    } catch (e) {
+      // 单轮失败不退出：下个 5 分钟刻自动重试（登录失败/网络抖动均可自愈）
+      console.error(`[${ts()}] 采集失败（下轮重试）：`, e.message)
+    }
+  }
+  console.log(`[${ts()}] 本轮 50 分钟结束，退出（工作流将自我续链；cron 备份兜底）`)
+}
+
 // ===== 独立运行入口（GitHub Actions / 本地 node index.js） =====
 
 if (require.main === module) {
-  collectOnce()
-    .then(r => {
-      console.log(`[${ts()}] 采集完成：${r.msg}`)
-      process.exit(0)
-    })
-    .catch(e => {
-      console.error(`[${ts()}] 采集失败：`, e.message)
-      process.exit(1)
-    })
+  if (process.env.RESIDENT === '1') {
+    runResident()
+      .then(() => process.exit(0))
+      .catch(e => {
+        console.error(`[${ts()}] 常驻异常退出：`, e.message)
+        process.exit(1)
+      })
+  } else {
+    collectOnce()
+      .then(r => {
+        console.log(`[${ts()}] 采集完成：${r.msg}`)
+        process.exit(0)
+      })
+      .catch(e => {
+        console.error(`[${ts()}] 采集失败：`, e.message)
+        process.exit(1)
+      })
+  }
 }
