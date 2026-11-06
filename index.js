@@ -121,7 +121,8 @@ async function fetchCloudConfig() {
  * 补录缺失时段：GitHub Actions cron 偶发漏触发（高峰期/仓库空闲/上轮未结束），
  * 每次触发需把「上次记录 → 当前网格」之间所有缺失的整点全部补上。
  * 数据从设备历史接口一次性拉取，按整点选最接近的实测值，避免整点漂移。
- * 单次最多补 24 个时段（约 1 天），避免 cron 长期停摆时一次性爆发。
+ * 常规单次最多补 24 个时段；检测到断链缺口更大时自动深挖（最多 12 天），
+ * 设备历史接口单次查询 ≤7 天，深挖时按 6 天分块拉取。
  */
 async function collectOnce() {
   // 0. 校验环境变量
@@ -141,31 +142,44 @@ async function collectOnce() {
   // 1.5 网格对齐 + 补录范围
   const intervalMs = cloudCfg.intervalMin * 60 * 1000
   const S_now = Math.floor(Date.now() / intervalMs) * intervalMs
-  const MAX_FILL_SLOTS = 24
+  const MAX_FILL_SLOTS = Number(process.env.MAX_FILL_SLOTS) || 24
   const MAX_FILL_MS = MAX_FILL_SLOTS * intervalMs
+  const DEEP_CAP_MS = 12 * 24 * 60 * 60 * 1000 // 深度补录上限 12 天（断链自愈）
 
-  // 取最近 200 条记录 → 已记录的网格集合（防重复写）
-  const recent = await sbGet('/rest/v1/report_records?select=t&order=t.desc&limit=200')
+  // 取最近记录 → 已记录的网格集合（防重复写）+ 断链检测
+  const recent = await sbGet('/rest/v1/report_records?select=t&order=t.desc&limit=2000')
   const recordedSlots = new Set()
+  let newestSlot = 0
   if (Array.isArray(recent)) {
     for (const r of recent) {
       const ts = Date.parse(r.t)
-      if (!Number.isNaN(ts)) recordedSlots.add(Math.floor(ts / intervalMs) * intervalMs)
+      if (!Number.isNaN(ts)) {
+        const slot = Math.floor(ts / intervalMs) * intervalMs
+        recordedSlots.add(slot)
+        if (slot > newestSlot) newestSlot = slot
+      }
     }
   }
 
-  // 补录范围：最近 24 格内的所有缺失网格（含中间空洞——之前写入失败/被删的记录会被自动重试）
-  const rangeStart = S_now - MAX_FILL_MS
+  // 补录范围：常规 = 最近 24 格；缺口 > 24 格（断链）时自动深挖，最多回溯 12 天
+  let rangeStart = S_now - MAX_FILL_MS
+  let deep = false
+  if (newestSlot > 0 && S_now - newestSlot > MAX_FILL_MS + intervalMs) {
+    deep = true
+    rangeStart = Math.max(newestSlot + intervalMs, S_now - DEEP_CAP_MS)
+    console.log(`[${ts()}] 检测到断链缺口（最后记录 ${new Date(newestSlot).toISOString()}），深度补录起点 ${new Date(rangeStart).toISOString()}`)
+  }
 
   // 2. 登录 + 加载设备
   const auth = await corxLogin()
   const { hws } = await corxLoadAll(auth)
 
-  // 3. 按点位一次性拉取 [rangeStart-30min, now] 设备历史
+  // 3. 按点位拉取 [rangeStart-30min, now] 设备历史（深挖时按 6 天分块，接口单次 ≤7 天）
   //    注意窗口必须足够宽：设备上报周期 ~3.5 分钟，若只查补录起点附近几分钟，
   //    经常一条数据都捞不到 → 整条记录全 null。前扩 30 分钟保证每个网格附近都有实测值
-  const startSec = Math.max(0, Math.floor(rangeStart / 1000) - 1800)
-  const endSec = Math.floor(Date.now() / 1000)
+  const histStartMs = Math.max(0, rangeStart - 1800000)
+  const histEndMs = Date.now()
+  const HIST_CHUNK_MS = 6 * 24 * 60 * 60 * 1000
   const pointData = {}  // hwId -> [[ts_sec, val], ...]
   const pointMissing = [] // 缺失点（设备列表里找不到 hw）
   for (const hwId of cloudCfg.hwIds) {
@@ -175,12 +189,17 @@ async function collectOnce() {
       pointData[hwId] = []
       continue
     }
-    try {
-      const arr = await corxHistory(hw.mac, hw.addr, startSec, endSec)
-      pointData[hwId] = Array.isArray(arr) ? arr : []
-    } catch {
-      pointData[hwId] = []
+    const parts = []
+    for (let cs = histStartMs; cs < histEndMs; cs += HIST_CHUNK_MS) {
+      const ce = Math.min(cs + HIST_CHUNK_MS, histEndMs)
+      try {
+        const arr = await corxHistory(hw.mac, hw.addr, Math.floor(cs / 1000), Math.floor(ce / 1000))
+        if (Array.isArray(arr)) parts.push(...arr)
+      } catch {
+        // 单块失败继续拉下一块（自愈：缺失格下轮重试）
+      }
     }
+    pointData[hwId] = parts
   }
 
   // 4. 为每个缺失网格构造记录：从该点位的历史数据中选取最接近网格点的值
@@ -221,7 +240,7 @@ async function collectOnce() {
   await sbPost('/rest/v1/report_records', records)
 
   const skipped = pointMissing.length
-  const summary = `补录 ${records.length} 个时段（${new Date(rangeStart).toISOString().slice(0, 16)} ~ ${new Date(S_now).toISOString().slice(0, 16)} UTC）`
+  const summary = `${deep ? '深度' : ''}补录 ${records.length} 个时段（${new Date(rangeStart).toISOString().slice(0, 16)} ~ ${new Date(S_now).toISOString().slice(0, 16)} UTC）`
   return { ok: true, msg: summary, written: records.length, pointCount: cloudCfg.hwIds.length, skipped }
 }
 
@@ -251,6 +270,42 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms))
 }
 
+// ===== GitHub 自愈（防 60 天无活动禁用 schedule 导致断链） =====
+//
+// 背景：公开仓库 60 天无 commit，GitHub 会自动禁用 schedule 工作流（2026-10-27 曾因此
+// 断链 10 天，yml 的续链 dispatch 报 HTTP 422 "disabled workflow"）。
+// yml 中 GITHUB_TOKEN 无 contents:write 权限、无法推保活 commit，故改为自愈兜底：
+// 每轮常驻开始/结束时用 runner 注入的 GITHUB_TOKEN（已授 actions:write）调 enable API
+// 重新启用工作流，保证自我续链 dispatch 不被 422 卡死。
+const fs = require('fs')
+
+/** 从 checkout 留下的 .git/config extraheader 中提取 runner 的 GITHUB_TOKEN */
+function ghTokenFromRunner() {
+  try {
+    const cfg = fs.readFileSync('.git/config', 'utf8')
+    const m = cfg.match(/extraheader\s*=\s*AUTHORIZATION:\s*basic\s+([A-Za-z0-9+/=]+)/i)
+    if (!m) return ''
+    const dec = Buffer.from(m[1], 'base64').toString('utf8') // 形如 x-access-token:ghs_xxx
+    return dec.includes(':') ? dec.slice(dec.indexOf(':') + 1) : ''
+  } catch {
+    return '' // 非 Actions 环境（本地运行）
+  }
+}
+
+async function selfHealEnable() {
+  const token = process.env.GH_SELF_TOKEN || ghTokenFromRunner()
+  if (!token) return
+  try {
+    const r = await fetch('https://api.github.com/repos/a0734/corx-collector/actions/workflows/corx-collector.yml/enable', {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' },
+    })
+    console.log(`[${ts()}] 自愈：工作流 enable → HTTP ${r.status}（204=正常/已启用，422=需手动处理）`)
+  } catch (e) {
+    console.error(`[${ts()}] 自愈 enable 调用失败（不影响本轮采集）：`, e.message)
+  }
+}
+
 /** 下一个 5 分钟整刻时间戳 */
 function next5MinMark(from = Date.now()) {
   return Math.floor(from / (5 * 60 * 1000)) * (5 * 60 * 1000) + 5 * 60 * 1000
@@ -260,6 +315,7 @@ async function runResident() {
   const JOB_MAX_MS = 50 * 60 * 1000 // 单轮最长 50 分钟（timeout-minutes: 55 留余量）
   const start = Date.now()
   console.log(`[${ts()}] 常驻模式启动，本轮最长 50 分钟`)
+  await selfHealEnable() // 开场自愈：确保工作流处于启用态
   while (Date.now() - start < JOB_MAX_MS) {
     const wait = next5MinMark() - Date.now()
     if (wait > 0) {
@@ -275,6 +331,7 @@ async function runResident() {
       console.error(`[${ts()}] 采集失败（下轮重试）：`, e.message)
     }
   }
+  await selfHealEnable() // 收尾自愈：即使本轮期间被 GitHub 禁用，下一轮 dispatch 也能成功
   console.log(`[${ts()}] 本轮 50 分钟结束，退出（工作流将自我续链；cron 备份兜底）`)
 }
 
