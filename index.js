@@ -146,28 +146,31 @@ async function collectOnce() {
   const MAX_FILL_MS = MAX_FILL_SLOTS * intervalMs
   const DEEP_CAP_MS = 12 * 24 * 60 * 60 * 1000 // 深度补录上限 12 天（断链自愈）
 
-  // 取最近记录 → 已记录的网格集合（防重复写）+ 断链检测
+  // 取最近记录 → 已记录的网格集合（防重复写，2000 条覆盖 80+ 天小时级数据）
   const recent = await sbGet('/rest/v1/report_records?select=t&order=t.desc&limit=2000')
   const recordedSlots = new Set()
-  let newestSlot = 0
   if (Array.isArray(recent)) {
     for (const r of recent) {
       const ts = Date.parse(r.t)
       if (!Number.isNaN(ts)) {
-        const slot = Math.floor(ts / intervalMs) * intervalMs
-        recordedSlots.add(slot)
-        if (slot > newestSlot) newestSlot = slot
+        recordedSlots.add(Math.floor(ts / intervalMs) * intervalMs)
       }
     }
   }
 
-  // 补录范围：常规 = 最近 24 格；缺口 > 24 格（断链）时自动深挖，最多回溯 12 天
-  let rangeStart = S_now - MAX_FILL_MS
-  let deep = false
-  if (newestSlot > 0 && S_now - newestSlot > MAX_FILL_MS + intervalMs) {
-    deep = true
-    rangeStart = Math.max(newestSlot + intervalMs, S_now - DEEP_CAP_MS)
-    console.log(`[${ts()}] 检测到断链缺口（最后记录 ${new Date(newestSlot).toISOString()}），深度补录起点 ${new Date(rangeStart).toISOString()}`)
+  // 补录范围：扫描已记录网格，找出所有缺失格（含中间空洞——断链/漏采/写入失败均可自愈）
+  // 缺失格数 > 24（断链）时自动深挖，最多回溯 12 天
+  let oldestSlot = 0
+  for (const s of recordedSlots) if (!oldestSlot || s < oldestSlot) oldestSlot = s
+  const scanStart = oldestSlot > 0 ? Math.max(oldestSlot, S_now - DEEP_CAP_MS) : S_now - MAX_FILL_MS
+  const missingSlots = []
+  for (let s = scanStart; s <= S_now; s += intervalMs) {
+    if (!recordedSlots.has(s)) missingSlots.push(s)
+  }
+  const deep = missingSlots.length > MAX_FILL_SLOTS
+  const rangeStart = missingSlots.length ? missingSlots[0] : S_now - MAX_FILL_MS
+  if (deep) {
+    console.log(`[${ts()}] 检测到断链缺口：缺失 ${missingSlots.length} 格，深度补录起点 ${new Date(rangeStart).toISOString()}`)
   }
 
   // 2. 登录 + 加载设备
