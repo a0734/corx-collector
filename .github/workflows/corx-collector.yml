@@ -4,6 +4,9 @@
 #   1. 每个任务常驻 50 分钟，每 5 分钟整刻采集一轮（index.js 的 RESIDENT 模式）
 #   2. 任务结束前自我 dispatch 触发下一轮 → 24/7 续链
 #   3. cron 每 15 分钟保活备份（续链意外断裂时兜底重启，错开整点避免影响整点采集）
+#   4. 每日保活 commit（公开仓库 60 天无 commit 会被 GitHub 自动禁用 schedule，
+#      2026-10-27 曾因此断链 10 天；每天首个任务更新 .keepalive 文件重置时钟）
+#   5. 续链失败自愈：若工作流被禁用（HTTP 422），先自动 enable 再 dispatch
 #
 # 费用：公开仓库 Actions 永久免费不限量（本仓库已设为 public，密码存于 Secrets 不入库）
 #
@@ -13,6 +16,7 @@
 # 3. 仓库 Settings → Secrets and variables → Actions → New repository secret：
 #    - CORX_TEL = CORX 手机号
 #    - CORX_PASSWORD = CORX 密码
+#    - COLLECT_TOKEN = 有 repo 权限的 PAT（用于每日保活 commit，防 60 天禁用）
 # 4. 把本文件放到 .github/workflows/ 目录，push 后自动开始常驻采集
 #
 # 查看运行日志：仓库 → Actions 标签
@@ -28,7 +32,8 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  actions: write # 允许用 GITHUB_TOKEN 自我 dispatch 续链
+  actions: write # 允许用 GITHUB_TOKEN 自我 dispatch / enable 续链与自愈
+  contents: write # 允许保活步骤 commit .keepalive 文件
 
 # 同一时间只允许一个采集任务在跑；cron 保活触发的新任务会接管旧的
 concurrency:
@@ -53,18 +58,44 @@ jobs:
           RESIDENT: '1'
         run: node index.js
 
+      - name: 每日保活 commit（防 60 天无活动被禁用 schedule）
+        env:
+          KEEP_TOKEN: ${{ secrets.COLLECT_TOKEN }}
+        run: |
+          if [ -z "$KEEP_TOKEN" ]; then echo "未配置 COLLECT_TOKEN，跳过保活"; exit 0; fi
+          git config user.name "corx-keepalive"
+          git config user.email "actions@users.noreply.github.com"
+          date -u +%Y-%m-%d > .keepalive
+          if git diff --quiet -- .keepalive; then
+            echo "今天已保活过，无需 commit"
+          else
+            git add .keepalive
+            git commit -m "keepalive $(date -u +%Y-%m-%d)"
+            git push https://x-access-token:$KEEP_TOKEN@github.com/a0734/corx-collector.git main && echo "保活 commit 成功" || echo "保活 commit 失败（不影响采集）"
+          fi
+
       - name: 自我续链（触发下一轮常驻）
         if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          WF=corx-collector.yml
           for i in 1 2 3; do
-            if gh api -X POST repos/a0734/corx-collector/actions/workflows/corx-collector.yml/dispatches -f ref=main --silent; then
+            if gh api -X POST repos/a0734/corx-collector/actions/workflows/$WF/dispatches -f ref=main --silent; then
               echo "续链成功"
               exit 0
             fi
             echo "第 $i 次续链失败，5 秒后重试"
             sleep 5
           done
-          echo "续链失败（不影响数据，等待 cron 保活 15 分钟内自动重启）"
+          # 自愈：HTTP 422 = 工作流被 GitHub 禁用（60 天无活动），自动重新启用再续链
+          echo "尝试自愈：重新启用工作流…"
+          if gh api -X PUT repos/a0734/corx-collector/actions/workflows/$WF/enable --silent; then
+            echo "工作流已重新启用"
+            if gh api -X POST repos/a0734/corx-collector/actions/workflows/$WF/dispatches -f ref=main --silent; then
+              echo "自愈续链成功"
+              exit 0
+            fi
+          fi
+          echo "自愈失败（不影响数据，等待 cron 保活 15 分钟内自动重启）"
           exit 0
